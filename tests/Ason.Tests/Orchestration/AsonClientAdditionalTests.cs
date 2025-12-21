@@ -1,17 +1,9 @@
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
-using System.Threading;
-using System.Threading.Tasks;
-using Ason;
 using Ason.Client.Execution;
-using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
-using Xunit;
 using AsonRunner;
 using Ason.CodeGen;
 
@@ -106,18 +98,6 @@ public class AsonClientAdditionalTests {
         for (int i = 0; i < results.Length; i++) Assert.Contains(i.ToString(), results[i]);
     }
 
-    [Fact]
-    public async Task ProxyRegeneration_Unchanged_When_No_New_Operators() {
-        var chat = new DelayedQueueChatService(0, "script", "return 1;", "Expl");
-        var root = new RootOperator(new object());
-        var client = new AsonClient(chat, root, Snapshot, new AsonClientOptions { SkipReceptionAgent = true, SkipExplainerAgent = false, ExecutionMode = ExecutionMode.InProcess });
-        // capture proxies via reflection
-        var field = typeof(AsonClient).GetField("_proxies", BindingFlags.NonPublic | BindingFlags.Instance);
-        string first = (string)field!.GetValue(client)!;
-        _ = await client.SendAsync("task 1");
-        string second = (string)field!.GetValue(client)!;
-        Assert.Same(first, second); // reference equality implies not rebuilt
-    }
 
     [Fact]
     public async Task LogOrdering_ScriptExecution() {

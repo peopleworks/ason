@@ -1,4 +1,3 @@
-
 namespace Ason;
 
 public abstract class ProxyAttributeBase : Attribute
@@ -35,4 +34,6 @@ public sealed class AsonModelAttribute : ProxyAttributeBase
     public AsonModelAttribute(string? description = null) : base(description)
     {
     }
+
+    public string? McpToolName { get; set; }
 }

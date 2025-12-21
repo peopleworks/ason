@@ -43,7 +43,7 @@ public sealed class OperatorBuilder {
                     servers.Add((client.ServerInfo.Name, tools));
                 }
                 if (servers.Count > 0) {
-                    var (mcpProxy, mcpSignatures) = ProxySerializer.SerializeMcpServers(servers);
+                    var (mcpProxy, mcpSignatures) = ProxySerializer.SerializeMcpServers(servers, distinct);
                     proxies += mcpProxy;
                     signatures += mcpSignatures;
                 }

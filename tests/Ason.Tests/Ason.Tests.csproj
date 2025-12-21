@@ -5,11 +5,15 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <BaseOutputPath>..\bin</BaseOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.2" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="ModelContextProtocol" Version="0.4.0-preview.3" />
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.45.0" />
@@ -23,6 +27,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\samples\SimpleConsoleApp\MyConsoleApp.csproj" />
+    <ProjectReference Include="..\..\src\Ason.ExternalExecutor\Ason.ExternalExecutor.csproj" />
+    <ProjectReference Include="..\..\src\Ason.RemoteBridge\Ason.RemoteBridge.csproj" />
     <ProjectReference Include="..\..\src\Ason\Ason.csproj" />
   </ItemGroup>
 </Project>

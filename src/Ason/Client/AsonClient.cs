@@ -465,7 +465,7 @@ public class AsonClient : IChatClient {
                 var currentTrimmedStart = currentFull.TrimStart();
 
                 if (bufferingPossibleScript) {
-                    if (currentTrimmedStart.Equals("script", StringComparison.OrdinalIgnoreCase)) {
+                    if (currentTrimmedStart.StartsWith("script", StringComparison.OrdinalIgnoreCase)) {
                         proceedToScript = true;
                         bufferingPossibleScript = false;
                         collectingTaskBlock = true;

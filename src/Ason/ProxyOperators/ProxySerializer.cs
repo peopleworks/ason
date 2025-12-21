@@ -30,10 +30,19 @@ public static class ProxySerializer {
         return sb.ToString();
     }
 
-    public static (string runtime, string signatures) SerializeMcpServers(IEnumerable<(string name, IList<McpClientTool> tools)> servers) {
+    public static (string runtime, string signatures) SerializeMcpServers(IEnumerable<(string name, IList<McpClientTool> tools)> servers, Assembly[] assemblies) {
         var runtime = new StringBuilder();
         var sig = new StringBuilder();
         var modelSet = new HashSet<string>(StringComparer.Ordinal);
+
+        var mcpModelMap = GetTypesWithAttribute<AsonModelAttribute>(assemblies)
+            .Where(t => !string.IsNullOrEmpty(t.GetCustomAttribute<AsonModelAttribute>()?.McpToolName))
+            .ToDictionary(
+                t => t.GetCustomAttribute<AsonModelAttribute>()!.McpToolName!,
+                t => t.Name,
+                StringComparer.OrdinalIgnoreCase
+            );
+
         foreach (var (name, tools) in servers) {
             // Scan for complex input models first
             foreach (var tool in tools) {
@@ -45,7 +54,14 @@ public static class ProxySerializer {
                         prop.Value.TryGetProperty("type", out var typeElem) && typeElem.GetString() == "object" &&
                         prop.Value.TryGetProperty("properties", out _)) {
                         string modelName = ToPascal(tool.Name) + ToPascal(prop.Name) + "Input";
-                        if (modelSet.Add(modelName)) BuildModelClassStandalone(modelName, prop.Value, runtime, sig);
+                        if (mcpModelMap.TryGetValue($"{name}.{tool.Name}", out var mappedName))
+                        {
+                            // It's a pre-defined model, don't generate it.
+                        }
+                        else if (modelSet.Add(modelName))
+                        {
+                            BuildModelClassStandalone(modelName, prop.Value, runtime, sig, mcpModelMap, name, tool.Name);
+                        }
                     }
                 }
             }
@@ -55,7 +71,7 @@ public static class ProxySerializer {
             foreach (var tool in tools) {
                 string methodName = ToPascal(tool.Name);
                 var schema = TryGetToolSchema(tool);
-                var (rtParams, sigParams, argDict) = BuildToolParameters(tool, schema);
+                var (rtParams, sigParams, argDict) = BuildToolParameters(tool, schema, mcpModelMap, name);
                 if (!string.IsNullOrWhiteSpace(tool.Description)) {
                     foreach (var line in tool.Description.Split('\n')) {
                         var trimmed = line.Trim(); if (trimmed.Length > 0) { runtime.AppendLine($"    // {trimmed}"); sig.AppendLine($"    // {trimmed}"); }
@@ -251,14 +267,14 @@ public static class ProxySerializer {
     private static IEnumerable<string> SplitLines(string value) => value.Replace("\r\n","\n").Replace('\r','\n').Split('\n');
 
     // MCP helpers
-    private static void BuildModelClassStandalone(string modelName, JsonElement schema, StringBuilder runtime, StringBuilder sig) {
+    private static void BuildModelClassStandalone(string modelName, JsonElement schema, StringBuilder runtime, StringBuilder sig, Dictionary<string, string> mcpModelMap, string serverName, string toolName) {
         runtime.AppendLine("[ProxyModel]");
         runtime.AppendLine($"public class {modelName} {{");
         sig.AppendLine("[ProxyModel]");
         sig.AppendLine($"public class {modelName} {{");
         if (schema.TryGetProperty("properties", out var props) && props.ValueKind == JsonValueKind.Object) {
             foreach (var p in props.EnumerateObject()) {
-                string csType = MapJsonTypeToCSharp(p.Value, out _, modelName, p.Name);
+                string csType = MapJsonTypeToCSharp(p.Value, out _, toolName, p.Name, serverName, mcpModelMap);
                 string pascal = ToPascal(p.Name);
                 runtime.AppendLine($"    public {csType} {pascal} {{ get; set; }}");
                 sig.AppendLine($"    public {csType} {pascal};");
@@ -267,7 +283,7 @@ public static class ProxySerializer {
         runtime.AppendLine("}"); sig.AppendLine("}");
     }
 
-    private static (string runtimeParams, string sigParams, string argDictBuilder) BuildToolParameters(McpClientTool tool, JsonElement? schema) {
+    private static (string runtimeParams, string sigParams, string argDictBuilder) BuildToolParameters(McpClientTool tool, JsonElement? schema, Dictionary<string, string> mcpModelMap, string serverName) {
         var runtimeParams = new List<string>(); var sigParams = new List<string>(); var argPairs = new List<string>();
         JsonElement? effective = schema;
         try {
@@ -282,20 +298,20 @@ public static class ProxySerializer {
         if (effective is JsonElement root && root.ValueKind == JsonValueKind.Object) {
             bool used = false;
             if (root.TryGetProperty("properties", out var props) && props.ValueKind == JsonValueKind.Object) {
-                used = true; foreach (var p in props.EnumerateObject()) AddToolParam(tool, p.Name, p.Value, runtimeParams, sigParams, argPairs);
+                used = true; foreach (var p in props.EnumerateObject()) AddToolParam(tool, p.Name, p.Value, runtimeParams, sigParams, argPairs, mcpModelMap, serverName);
             }
             if (!used) {
                 foreach (var p in root.EnumerateObject()) {
                     if (p.NameEquals("type") || p.NameEquals("title") || p.NameEquals("description") || p.NameEquals("required")) continue;
-                    if (p.Value.ValueKind == JsonValueKind.Object && (p.Value.TryGetProperty("type", out _) || p.Value.TryGetProperty("properties", out _))) AddToolParam(tool, p.Name, p.Value, runtimeParams, sigParams, argPairs);
+                    if (p.Value.ValueKind == JsonValueKind.Object && (p.Value.TryGetProperty("type", out _) || p.Value.TryGetProperty("properties", out _))) AddToolParam(tool, p.Name, p.Value, runtimeParams, sigParams, argPairs, mcpModelMap, serverName);
                 }
             }
         }
         return (string.Join(", ", runtimeParams), string.Join(", ", sigParams), string.Join(", ", argPairs));
     }
 
-    private static void AddToolParam(McpClientTool tool, string rawName, JsonElement schemaElem, List<string> runtimeParams, List<string> sigParams, List<string> argPairs) {
-        string csType = MapJsonTypeToCSharp(schemaElem, out bool isComplex, tool.Name, rawName);
+    private static void AddToolParam(McpClientTool tool, string rawName, JsonElement schemaElem, List<string> runtimeParams, List<string> sigParams, List<string> argPairs, Dictionary<string, string> mcpModelMap, string serverName) {
+        string csType = MapJsonTypeToCSharp(schemaElem, out bool isComplex, tool.Name, rawName, serverName, mcpModelMap);
         string paramName = "@" + CamelCase(rawName);
         runtimeParams.Add($"{csType} {paramName}"); sigParams.Add($"{csType} {paramName}");
         if (isComplex) argPairs.Add($"[\"{rawName}\"] = {paramName} == null ? null : new Dictionary<string, object?>({paramName}.GetType().GetProperties().ToDictionary(pi => char.ToLowerInvariant(pi.Name[0]) + pi.Name.Substring(1), pi => (object?)pi.GetValue({paramName})))");
@@ -312,7 +328,7 @@ public static class ProxySerializer {
         return null;
     }
 
-    private static string MapJsonTypeToCSharp(JsonElement prop, out bool isComplexModel, string toolName = "", string propName = "") {
+    private static string MapJsonTypeToCSharp(JsonElement prop, out bool isComplexModel, string toolName = "", string propName = "", string serverName = "", Dictionary<string, string>? mcpModelMap = null) {
         isComplexModel = false;
         if (prop.ValueKind == JsonValueKind.Object && prop.TryGetProperty("type", out var tElem)) {
             var t = tElem.GetString();
@@ -322,7 +338,17 @@ public static class ProxySerializer {
                 case "number": return "double";
                 case "boolean": return "bool";
                 case "array": return "object[]";
-                case "object": isComplexModel = true; return ToPascal(toolName) + ToPascal(propName) + "Input";
+                case "object":
+                    isComplexModel = true;
+                    if (mcpModelMap != null && !string.IsNullOrEmpty(serverName) && !string.IsNullOrEmpty(toolName))
+                    {
+                        string lookupKey = $"{serverName}.{toolName}";
+                        if (mcpModelMap.TryGetValue(lookupKey, out var modelName))
+                        {
+                            return modelName;
+                        }
+                    }
+                    return ToPascal(toolName) + ToPascal(propName) + "Input";
             }
         }
         return "object";

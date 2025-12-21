@@ -1,11 +1,12 @@
 using System.Collections.Concurrent;
 using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Agents;
+using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 using Ason;
 using Ason.Client.Execution;
+using Ason.Tests.Infrastructure;
 using Microsoft.Extensions.Logging;
 using System.Threading.Tasks;
 using System.Threading;
@@ -14,22 +15,6 @@ using System.Text;
 namespace Ason.Tests.Execution;
 
 public class ScriptRepairExecutorTests {
-
-    private sealed class QueueChatService : IChatCompletionService {
-        private readonly ConcurrentQueue<string> _responses = new();
-        public QueueChatService(params string[] replies) { foreach (var r in replies) _responses.Enqueue(r); }
-        public void Enqueue(params string[] replies) { foreach (var r in replies) _responses.Enqueue(r); }
-        public IReadOnlyDictionary<string, object?> Attributes { get; } = new Dictionary<string, object?>();
-        private string Next() => _responses.TryDequeue(out var v) ? v : string.Empty;
-        public Task<IReadOnlyList<ChatMessageContent>> GetChatMessageContentsAsync(ChatHistory chatHistory, PromptExecutionSettings? executionSettings = null, Kernel? kernel = null, CancellationToken cancellationToken = default) {
-            IReadOnlyList<ChatMessageContent> list = new List<ChatMessageContent>{ new ChatMessageContent(AuthorRole.Assistant, Next())};
-            return Task.FromResult(list);
-        }
-        public async IAsyncEnumerable<StreamingChatMessageContent> GetStreamingChatMessageContentsAsync(ChatHistory chatHistory, PromptExecutionSettings? executionSettings = null, Kernel? kernel = null, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default) {
-            var list = await GetChatMessageContentsAsync(chatHistory, executionSettings, kernel, cancellationToken);
-            foreach (var m in list) yield return new StreamingChatMessageContent(m.Role, m.Content ?? string.Empty);
-        }
-    }
 
     private static ChatCompletionAgent CreateAgent(IChatCompletionService svc) {
         var builder = Kernel.CreateBuilder();
@@ -50,7 +35,8 @@ public class ScriptRepairExecutorTests {
     private static ScriptRepairExecutor Executor() => new();
 
     private static Task<ExecOutcome> RunAsync(ScriptRepairExecutor exec, string userTask, int maxAttempts, string[] agentReplies, IScriptValidator validator, string? proxies = null, CancellationToken ct = default) {
-        var svc = new QueueChatService(agentReplies); // replies consumed sequentially by agent attempts
+        var svc = new StubChatCompletionService("// default script\nreturn null;");
+        svc.Enqueue(agentReplies);
         var agent = CreateAgent(svc);
         var runner = CreateInProcRunner();
         return exec.ExecuteWithRepairsAsync(userTask, maxAttempts, proxies, agent, runner, validator, (lvl,msg,ex)=>{}, ct);

@@ -1,0 +1,6 @@
+@TestRemoteExecutorServer_HostAddress = http://localhost:5025
+
+GET {{TestRemoteExecutorServer_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
