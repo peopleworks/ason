@@ -1,4 +1,6 @@
-﻿using System.Text;
+using System;
+using System.Linq;
+using System.Text;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Agents;
 using Microsoft.SemanticKernel.ChatCompletion;
@@ -6,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.AI;
 using Ason.Client.Execution;
+using Ason.Client.Orchestration;
 using Ason.Invocation;
 using Ason.CodeGen;
 using System.Threading.Channels;
@@ -33,10 +36,13 @@ public class AsonClient : IChatClient {
 
     readonly AsonClientOptions _options;
     readonly OperatorsLibrary _operatorsLibrary;
+    readonly ILogger? _logger;
 
     readonly IScriptRepairExecutor _repairExecutor;
     readonly IScriptValidator _validator;
     readonly IResultExplainer _resultExplainer;
+    readonly IReceptionRouter _receptionRouter;
+    readonly IScriptRouteExecutor _scriptRouteExecutor;
 
     internal static AsonClient? CurrentInstance;
 
@@ -53,7 +59,8 @@ public class AsonClient : IChatClient {
 
     internal Kernel ReceptionKernel => _receptionKernel;
 
-    string? _consolidatedUserTask;
+    OrchestrationContext CreateContext(ChatHistoryAgentThread thread, string userTask) =>
+        new(thread, userTask, _options.SkipReceptionAgent, _options.SkipExplainerAgent);
 
     public AsonClient(
         IChatCompletionService defaultChatCompletion,
@@ -70,6 +77,7 @@ public class AsonClient : IChatClient {
         IResultExplainer? resultExplainer) {
         _options = options ?? new AsonClientOptions();
         _operatorsLibrary = operators ?? throw new ArgumentNullException(nameof(operators));
+        _logger = _options.Logger;
         MaxScriptFixAttempts = _options.MaxFixAttempts;
 
         DefaultChatCompletion = defaultChatCompletion;
@@ -96,6 +104,8 @@ public class AsonClient : IChatClient {
         _repairExecutor = repairExecutor ?? new ScriptRepairExecutor();
         _validator = validator ?? new KeywordScriptValidator(_options.ForbiddenScriptKeywords);
         _resultExplainer = resultExplainer ?? new ResultExplainer();
+        _receptionRouter = new ReceptionRouter();
+        _scriptRouteExecutor = new ScriptRouteExecutor(_repairExecutor, _validator, _resultExplainer, MaxScriptFixAttempts);
 
         _runner.MethodInvoking += (s, e) => {
             e.UserTask ??= _agentThread?.ChatHistory.Where(m => m.Role == AuthorRole.User).LastOrDefault()?.Content;
@@ -226,93 +236,6 @@ public class AsonClient : IChatClient {
         }
     }
 
-    enum RouteKind { Script, Answer }
-
-    async Task<(RouteKind route, string payload)> DecideRouteAdvanceAsync(string userTask, bool skipAnswer, ChatCompletionAgent? receptionAgent, ChatHistoryAgentThread thread, Action<LogLevel, string, Exception?> log, CancellationToken ct) {
-        if (skipAnswer) { log(LogLevel.Information, "Skipping ReceptionAgent; routing directly to ScriptAgent.", null); _consolidatedUserTask = userTask; return (RouteKind.Script, userTask); }
-        if (receptionAgent is null) { _consolidatedUserTask ??= userTask; return (RouteKind.Script, userTask); }
-        var sb = new StringBuilder();
-        try {
-            var messages = new[] { new ChatMessageContent(AuthorRole.User, userTask) };
-            OnLog(LogLevel.Information, $"ReceptionAgent input: {userTask}");
-            await foreach (var item in receptionAgent.InvokeAsync(messages, thread: thread, options: null, cancellationToken: ct).ConfigureAwait(false)) {
-                var part = item.Message?.Content; if (!string.IsNullOrWhiteSpace(part)) sb.Append(part);
-            }
-            var decisionRaw = sb.ToString();
-            var trimmed = decisionRaw.Trim();
-
-            OnLog(LogLevel.Information, $"ReceptionAgent completed output: {trimmed}");
-            if (string.IsNullOrWhiteSpace(trimmed)) { _consolidatedUserTask = userTask; return (RouteKind.Script, userTask); }
-            if (trimmed.StartsWith("script", StringComparison.OrdinalIgnoreCase)) {
-                string synthesized = ExtractTaskBlock(trimmed) ?? userTask;
-                _consolidatedUserTask = synthesized;
-                return (RouteKind.Script, synthesized);
-            }
-            _consolidatedUserTask = null;
-            return (RouteKind.Answer, trimmed);
-        }
-        catch (Exception ex) { log(LogLevel.Error, "ReceptionAgent routing error", ex); throw; }
-    }
-
-    static string? ExtractTaskBlock(string receptionAgentOutput) {
-        int start = receptionAgentOutput.IndexOf("<task>", StringComparison.OrdinalIgnoreCase);
-        if (start < 0) return null;
-        int end = receptionAgentOutput.IndexOf("</task>", start, StringComparison.OrdinalIgnoreCase);
-        if (end < 0) return null;
-        int innerStart = start + "<task>".Length;
-        var inner = receptionAgentOutput.Substring(innerStart, end - innerStart).Trim();
-        return string.IsNullOrWhiteSpace(inner) ? null : inner;
-    }
-
-    async Task<OrchestrationResult> ExecuteScriptRouteNonStreamingAsync(string task, ChatHistoryAgentThread thread, bool skipExplainer, CancellationToken cancellationToken) {
-        var effectiveTask = _consolidatedUserTask ?? task;
-        var outcome = await TryExecuteWithRepairsAsync(effectiveTask, cancellationToken).ConfigureAwait(false);
-        if (!outcome.Success && outcome.ErrorMessage?.StartsWith("Cannot", StringComparison.OrdinalIgnoreCase) == true) {
-            thread.ChatHistory.AddAssistantMessage(outcome.ErrorMessage);
-            return new OrchestrationResult(false, "script", outcome.ErrorMessage, null, outcome.ExecutedScript, outcome.Attempts);
-        }
-        if (!outcome.Success) {
-            var msg = outcome.ErrorMessage ?? "Task could not be executed.";
-            thread.ChatHistory.AddAssistantMessage(msg);
-            return new OrchestrationResult(false, "script", msg, null, outcome.ExecutedScript, outcome.Attempts);
-        }
-        if (string.IsNullOrEmpty(outcome.RawResult)) return new OrchestrationResult(true, "script", "Task completed", null, outcome.ExecutedScript, outcome.Attempts);
-        if (skipExplainer) { thread.ChatHistory.AddAssistantMessage(outcome.RawResult!); return new OrchestrationResult(true, "script", outcome.RawResult, outcome.RawResult, outcome.ExecutedScript, outcome.Attempts); }
-        string explanation = await _resultExplainer.ExplainAsync(effectiveTask, outcome.RawResult!, _explainerAgent!, (lvl, msg, ex) => OnLog(lvl, msg, ex), cancellationToken).ConfigureAwait(false);
-        var trimmed = explanation.Trim(); thread.ChatHistory.AddAssistantMessage(trimmed);
-        return new OrchestrationResult(true, "script", trimmed, outcome.RawResult, outcome.ExecutedScript, outcome.Attempts);
-    }
-
-    async IAsyncEnumerable<ChatResponseUpdate> StreamScriptRouteAsync(string task, ChatHistoryAgentThread thread, bool skipExplainer, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken) {
-        var effectiveTask = _consolidatedUserTask ?? task;
-        var outcome = await TryExecuteWithRepairsAsync(effectiveTask, cancellationToken);
-        if (!outcome.Success && outcome.ErrorMessage?.StartsWith("Cannot", StringComparison.OrdinalIgnoreCase) == true) { yield return new ChatResponseUpdate(ChatRole.Assistant, outcome.ErrorMessage); yield break; }
-        if (!outcome.Success) { var msg = outcome.ErrorMessage ?? "Task could not be executed."; yield return new ChatResponseUpdate(ChatRole.Assistant, msg); yield break; }
-        if (string.IsNullOrEmpty(outcome.RawResult)) { yield return new ChatResponseUpdate(ChatRole.Assistant, "Task completed"); yield break; }
-        if (skipExplainer) { thread.ChatHistory.AddAssistantMessage(outcome.RawResult!); yield return new ChatResponseUpdate(ChatRole.Assistant, outcome.RawResult); yield break; }
-        var explainerInput = "<task>\n" + effectiveTask + "\n</task>\n<result>\n" + outcome.RawResult + "\n</result>";
-        var sbExplainer = new StringBuilder();
-        var explainerMessages = new[] { new ChatMessageContent(AuthorRole.User, explainerInput) };
-        await foreach (var item in _explainerAgent!.InvokeStreamingAsync(explainerMessages, thread: null, options: null, cancellationToken)) {
-            var part = item.Message?.Content; if (part is null) continue; sbExplainer.Append(part); if (part.Length > 0) yield return new ChatResponseUpdate(ChatRole.Assistant, part);
-        }
-        var full = sbExplainer.ToString(); if (!string.IsNullOrEmpty(full)) thread.ChatHistory.AddAssistantMessage(full);
-    }
-
-    async Task<OrchestrationResult> SendDetailedAsync(ChatHistoryAgentThread thread, CancellationToken cancellationToken = default) {
-        // Offload entire orchestration to background thread so caller's (UI) sync context is not blocked
-        return await Task.Run(async () => {
-            string userTask = ExtractLatestUserMessage(thread) ?? string.Empty;
-            bool skipAnswer = _options.SkipReceptionAgent;
-            bool skipExplainer = _options.SkipExplainerAgent;
-            var (route, payload) = await DecideRouteAdvanceAsync(userTask, skipAnswer, _receptionAgent, thread, (lvl, msg, ex) => OnLog(lvl, msg, ex), cancellationToken).ConfigureAwait(false);
-            if (route == RouteKind.Answer) { thread.ChatHistory.AddAssistantMessage(payload); return new OrchestrationResult(true, "answer", payload, null, null, 1); }
-            // payload may already be synthesized task if script route selected
-            var effectiveTask = _consolidatedUserTask ?? userTask;
-            return await ExecuteScriptRouteNonStreamingAsync(effectiveTask, thread, skipExplainer, cancellationToken).ConfigureAwait(false);
-        }, cancellationToken).ConfigureAwait(false);
-    }
-
     public async Task<string> ExecuteScriptDirectAsync(string script, bool validate = true) {
         if (string.IsNullOrWhiteSpace(script)) return string.Empty;
         // Entire operation offloaded so any networking / remote runner waits do not sit on UI thread
@@ -334,6 +257,20 @@ public class AsonClient : IChatClient {
                 return "Error";
             }
         }).ConfigureAwait(false);
+    }
+
+    async Task<OrchestrationResult> SendDetailedAsync(ChatHistoryAgentThread thread, CancellationToken cancellationToken = default) {
+        return await Task.Run(async () => {
+            string userTask = ExtractLatestUserMessage(thread) ?? string.Empty;
+            var context = CreateContext(thread, userTask);
+            var logger = new Action<LogLevel, string, Exception?>((lvl, msg, ex) => OnLog(lvl, msg, ex));
+            var decision = await _receptionRouter.DecideAsync(context, _receptionAgent, logger, cancellationToken).ConfigureAwait(false);
+            if (decision.Route == OrchestrationRoute.Answer) {
+                thread.ChatHistory.AddAssistantMessage(decision.Payload);
+                return new OrchestrationResult(true, "answer", decision.Payload, null, null, 1);
+            }
+            return await _scriptRouteExecutor.ExecuteAsync(context, _proxies, _scriptAgent!, _explainerAgent, _runner, logger, cancellationToken).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<string> SendAsync(string message, CancellationToken cancellationToken = default) {
@@ -371,32 +308,6 @@ public class AsonClient : IChatClient {
     }
 
     string? ExtractLatestUserMessage(ChatHistoryAgentThread thread) => thread.ChatHistory.Where(m => m.Role == AuthorRole.User).LastOrDefault()?.Content;
-
-    static string ConvertMessagesToString(IEnumerable<ChatMessage> messages) {
-        var sb = new StringBuilder();
-        foreach (var m in messages) {
-            if(m.Role == ChatRole.System)
-                continue;
-            var text = GetMessageText(m);
-            sb.Append('[').Append(m.Role).Append("] ");
-            if (!string.IsNullOrWhiteSpace(text)) sb.AppendLine(text); else sb.AppendLine("<empty>");
-        }
-        return sb.ToString().TrimEnd();
-    }
-
-    async Task<ExecOutcome> TryExecuteWithRepairsAsync(string userTask, CancellationToken ct) {
-        await _proxyAugmentationTask.ConfigureAwait(false);
-        await _runnerStart.ConfigureAwait(false);
-        return await _repairExecutor.ExecuteWithRepairsAsync(
-            userTask,
-            MaxScriptFixAttempts,
-            _proxies,
-            _scriptAgent!,
-            _runner,
-            _validator,
-            (lvl, msg, ex) => OnLog(lvl, msg, ex),
-            ct);
-    }
 
     (ChatHistoryAgentThread thread, string userTask) PrepareThreadFromMessages(IEnumerable<ChatMessage> messages) {
         var history = new ChatHistory();
@@ -446,72 +357,31 @@ public class AsonClient : IChatClient {
     private async Task ExecuteInternalStreamingCoreAsync(IEnumerable<ChatMessage> messages, ChannelWriter<ChatResponseUpdate> writer, CancellationToken cancellationToken) {
         await EnsureReadyAsync().ConfigureAwait(false);
         var (thread, userTask) = PrepareThreadFromMessages(messages);
-        bool skipAnswer = _options.SkipReceptionAgent;
-        bool skipExplainer = _options.SkipExplainerAgent;
-        bool proceedToScript = false;
-        _consolidatedUserTask = null;
-        if (skipAnswer) { OnLog(LogLevel.Information, "Skipping ReceptionAgent; routing directly to ScriptAgent."); _consolidatedUserTask = userTask; proceedToScript = true; }
-        else {
-            var sb = new StringBuilder();
-            bool bufferingPossibleScript = true;
-            bool collectingTaskBlock = false;
-
-            OnLog(LogLevel.Information, $"ReceptionAgent input:\n{ConvertMessagesToString(messages)}");
-            await foreach (var item in _receptionAgent!.InvokeStreamingAsync(thread: thread, options: null, cancellationToken).ConfigureAwait(false)) {
-                var part = item.Message?.Content;
-                if (part is null) continue;
-                sb.Append(part);
-                var currentFull = sb.ToString();
-                var currentTrimmedStart = currentFull.TrimStart();
-
-                if (bufferingPossibleScript) {
-                    if (currentTrimmedStart.StartsWith("script", StringComparison.OrdinalIgnoreCase)) {
-                        proceedToScript = true;
-                        bufferingPossibleScript = false;
-                        collectingTaskBlock = true;
-                        continue;
-                    }
-                    if ("script".StartsWith(currentTrimmedStart, StringComparison.OrdinalIgnoreCase)) {
-                        continue;
-                    }
-                    await writer.WriteAsync(new ChatResponseUpdate(ChatRole.Assistant, currentFull), cancellationToken).ConfigureAwait(false);
-                    bufferingPossibleScript = false;
-                }
-                else if (collectingTaskBlock) {
-                    if (currentFull.IndexOf("</task>", StringComparison.OrdinalIgnoreCase) >= 0) break;
-                    continue;
-                }
-                else {
-                    await writer.WriteAsync(new ChatResponseUpdate(ChatRole.Assistant, part), cancellationToken).ConfigureAwait(false);
-                }
+        var context = CreateContext(thread, userTask);
+        var logger = new Action<LogLevel, string, Exception?>((lvl, msg, ex) => OnLog(lvl, msg, ex));
+        var receptionResult = await _receptionRouter.DecideStreamingAsync(context, messages, _receptionAgent, writer, logger, cancellationToken).ConfigureAwait(false);
+        if (!receptionResult.ProceedToScript) {
+            var payload = receptionResult.AnswerPayload;
+            if (!string.IsNullOrWhiteSpace(payload) && !thread.ChatHistory.Any(m => m.Role == AuthorRole.Assistant && m.Content == payload)) {
+                thread.ChatHistory.AddAssistantMessage(payload);
             }
-            var all = sb.ToString();
-            OnLog(LogLevel.Information, $"ReceptionAgent completed output: {all}");
-            if (proceedToScript) {
-
-                _consolidatedUserTask = ExtractTaskBlock(all) ?? userTask;
-            }
-            else {
-
-                var full = all.Trim();
-                if (string.IsNullOrWhiteSpace(full)) { proceedToScript = true; _consolidatedUserTask = userTask; }
-                else if (!full.Equals("script", StringComparison.OrdinalIgnoreCase)) {
-                    if (!thread.ChatHistory.Any(m => m.Role == AuthorRole.Assistant && m.Content == full)) thread.ChatHistory.AddAssistantMessage(full);
-                    return;
-                }
-            }
+            return;
         }
-        if (proceedToScript) {
-            var effectiveTask = _consolidatedUserTask ?? userTask;
-            await foreach (var u in StreamScriptRouteAsync(effectiveTask, thread, skipExplainer, cancellationToken).ConfigureAwait(false)) {
-                await writer.WriteAsync(u, cancellationToken).ConfigureAwait(false);
-            }
+        await foreach (var update in _scriptRouteExecutor.StreamAsync(context, _proxies, _scriptAgent!, _explainerAgent, _runner, logger, cancellationToken).ConfigureAwait(false)) {
+            await writer.WriteAsync(update, cancellationToken).ConfigureAwait(false);
         }
     }
 
-    void OnLog(LogLevel level, string message, Exception? exception = null) => Log?.Invoke(this, new AsonLogEventArgs(level, message, exception?.ToString(), nameof(AsonClient)));
+    void OnLog(LogLevel level, string message, Exception? exception = null) {
+        _logger?.Log(level, exception, "{Message}", message);
+        Log?.Invoke(this, new AsonLogEventArgs(level, message, exception?.ToString(), nameof(AsonClient)));
+    }
 
-    object? IChatClient.GetService(Type serviceType, object? serviceKey) => serviceType.IsInstanceOfType(this) ? this : null;
+    object? IChatClient.GetService(Type serviceType, object? serviceKey) =>
+        serviceType.IsInstanceOfType(this) ? this : null;
 
-    void IDisposable.Dispose() { try { _runner.StopAsync().GetAwaiter().GetResult(); } catch { } }
+    void IDisposable.Dispose() {
+        try { _runner.StopAsync().GetAwaiter().GetResult(); }
+        catch { }
+    }
 }

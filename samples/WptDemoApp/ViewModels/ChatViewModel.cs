@@ -5,18 +5,15 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
-using ModelContextProtocol.Client; // MCP interfaces from Core
 using System.Diagnostics;
-using System.Net.Http;
 using System.Reflection;
-using System.Windows.Interop;
-using System.Collections.ObjectModel; // added
+using System.Collections.ObjectModel;
 using Microsoft.Extensions.AI;
-using WpfSampleApp.AI; // for ChatMessage
+using WpfSampleApp.AI; 
 
 namespace WpfSampleApp.ViewModels;
 
-public partial class ChatViewModel : ObservableObject {
+public partial class ChatViewModel(MainViewModel mainViewModel) : ObservableObject {
     [ObservableProperty]
     string userInput = "Update fist three employee names to John Doe";
 
@@ -30,34 +27,35 @@ public partial class ChatViewModel : ObservableObject {
         "Add an appointment based on data from the last email",
     };
 
-    // Maintain conversation history for new overload
+
+    MainViewModel _mainViewModel = mainViewModel;
     readonly List<ChatMessage> _messages = new();
 
     AsonClient Chat;
     static OperatorsLibrary? _sharedSnapshot;
 
-    static OperatorsLibrary GetOperators() => _sharedSnapshot ??= new OperatorBuilder()
+    async Task<OperatorsLibrary> GetOperatorsAsync() => _sharedSnapshot ??= new OperatorBuilder()
         .AddAssemblies(typeof(MainAppOperator).Assembly)
         //.AddExtractor()
-        //.AddMcp(CreateContext7Client())
+        //.AddMcp(await CreateContext7ClientAsync())
         .SetBaseFilter(mi => mi.GetCustomAttribute<AsonMethodAttribute>() != null)
         .Build();
 
-    //IMcpClient CreateContext7Client() {
-    //    var sharedHandler = new SocketsHttpHandler {
-    //        PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-    //        PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1)
-    //    };
-    //    var httpClient = new HttpClient(sharedHandler);
-    //    httpClient.DefaultRequestHeaders.Add("CONTEXT7_API_KEY", Environment.GetEnvironmentVariable("CONTEXT7_API_KEY"));
-    //    var transport = new SseClientTransport(new() { Endpoint = new Uri("https://mcp.context7.com/mcp"), Name = "context7" }, httpClient);
-    //    return McpClientFactory.CreateAsync(transport).GetAwaiter().GetResult();
+    //async Task<McpClient> CreateContext7ClientAsync() {
+    //    var httpClient = new HttpClient();
+    //    httpClient.DefaultRequestHeaders.Add("CONTEXT7_API_KEY", Environment.GetEnvironmentVariable("MY_CONTEXT7_API_KEY"));
+
+    //    return await McpClient.CreateAsync(
+    //        new HttpClientTransport(new HttpClientTransportOptions {
+    //            Endpoint = new Uri("https://mcp.context7.com/mcp")
+    //        }, httpClient)).ConfigureAwait(false);
     //}
 
-    public ChatViewModel(MainViewModel mainViewModel) {
+    [RelayCommand]
+    async Task Init() {
         var apiKey = Environment.GetEnvironmentVariable("MY_OPEN_AI_KEY") ?? string.Empty;
         IChatCompletionService chatService = new OpenAIChatCompletionService(modelId: "gpt-4.1-mini", apiKey: apiKey);
-        var operators = GetOperators();
+        var operators = await GetOperatorsAsync();
         var options = new AsonClientOptions {
             MaxFixAttempts = 2,
             SkipReceptionAgent = false,
@@ -66,16 +64,13 @@ public partial class ChatViewModel : ObservableObject {
             //UseRemoteRunner = true,
             //RemoteRunnerBaseUrl = "http://localhost:5236"
         };
-        Chat = new AsonClient(chatService, mainViewModel.MainAppOperator, operators, options);
+        Chat = new AsonClient(chatService, _mainViewModel.MainAppOperator, operators, options);
 
         Chat.Log += (sender, e) => {
             var prefix = $"[{e.Level}] ";
             Debug.WriteLine(prefix + e.Message + (e.Exception is not null ? "\n" + e.Exception : string.Empty));
         };
     }
-
-
-
 
     [RelayCommand]
     async Task SendMessage() {

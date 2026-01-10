@@ -10,5 +10,4 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Ason\Ason.csproj" />
   </ItemGroup>
-
 </Project>
